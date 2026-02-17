@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+:root {
+  font-family: 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  background-color: #050505;
+  color: #ffffff;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+@theme {
+  --color-neon-green: #00ff41;
+  --color-neon-blue: #008F11;
+  --font-mono: "Fira Code", monospace;
+}

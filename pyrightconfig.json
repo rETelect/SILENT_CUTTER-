@@ -1,0 +1,9 @@
+{
+  "venvPath": "/home/retelect/Desktop/newapp/backend",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "include": [
+    "backend"
+  ]
+}

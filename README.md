@@ -104,6 +104,4 @@ npm run electron:dev
 5.  **Render**: Click to render the final video with silence removed.
 6.  **Output**: The processed video will be saved in the `backend/outputs` directory.
 
-## License
 
-[MIT License](LICENSE)

@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react';
 import Scanner from './components/Scanner';
 import UploadZone from './components/UploadZone';
-import Timeline from './components/Timeline';
+import Timeline, { type Segment } from './components/Timeline';
 import './App.css';
 
 // Add global type for Electron API
@@ -23,7 +23,7 @@ function App() {
   const [processingEta, setProcessingEta] = useState<string>('');
   const [stepLabel, setStepLabel] = useState<string>('');
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [segments, setSegments] = useState<any[]>([]);
+  const [segments, setSegments] = useState<Segment[]>([]);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -265,7 +265,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           file_id: fileId,
-          segments: segments.filter((s: any) => s.type === 'keep' || !s.type)
+          segments: segments.filter((s: Segment) => s.type === 'keep' || !s.type)
         }),
       });
     } catch (e) {

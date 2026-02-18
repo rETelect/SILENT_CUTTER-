@@ -12,14 +12,13 @@ interface ScannerProps {
 const Scanner: React.FC<ScannerProps> = ({ progress, status, stepLabel, eta = '', onCancel, onReset }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [waveform, setWaveform] = useState<number[]>([]);
+  const [waveform] = useState<number[]>(() => {
+    const points = 100;
+    return Array.from({ length: points }, () => Math.random());
+  });
 
   // Generate random waveform on mount
-  useEffect(() => {
-    const points = 100;
-    const newWaveform = Array.from({ length: points }, () => Math.random());
-    setWaveform(newWaveform);
-  }, []);
+  // useEffect removed in favor of lazy initial state
 
   useEffect(() => {
     const canvas = canvasRef.current;

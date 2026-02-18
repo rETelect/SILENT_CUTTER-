@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 
-interface Segment {
+export interface Segment {
     start: number;
     end: number;
     type?: 'keep' | 'cut';

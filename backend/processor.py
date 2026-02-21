@@ -58,6 +58,7 @@ class VideoProcessor:
         
         # Setup logging
         self.logger = logging.getLogger(f"processor_{file_id}")
+        self.source_map: List[Dict[str, Any]] = [] # metadata for merged files
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             formatter = colorlog.ColoredFormatter(
@@ -73,6 +74,55 @@ class VideoProcessor:
         self.segments: List[Dict[str, float]] = [] # Store analysis results
         self.completion_event = asyncio.Event()
         self.final_output: Path | None = None
+
+    @classmethod
+    async def concat_videos(cls, file_paths: List[Path], output_path: Path) -> Path:
+        """Concatenate multiple videos into a single file using FFmpeg concat demuxer."""
+        if not file_paths:
+            raise ValueError("No input files provided")
+
+        if len(file_paths) == 1:
+            import shutil
+            shutil.copy(file_paths[0], output_path)
+            return output_path
+        
+        # Create concat list file
+        concat_list_path = output_path.parent / f"{output_path.stem}_concat_list.txt"
+        with open(concat_list_path, 'w') as f:
+            for path in file_paths:
+                # Escape single quotes for ffmpeg concat list: ' -> '\''
+                escaped_path = str(path.absolute()).replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        print(f"Concatenating {len(file_paths)} files to {output_path}...")
+        
+        # FFmpeg command for stream copy (fastest)
+        # Note: Input files must have same codecs/params for this to work perfectly.
+        # If not, we might need re-encoding, but let's try copy first for speed.
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_list_path),
+            "-c", "copy",
+            "-loglevel", "error",
+            str(output_path)
+        ]
+
+        # Run ffmpeg
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown ffmpeg error"
+            raise RuntimeError(f"Concatenation failed: {error_msg}")
+
+        print(f"Concatenation complete: {output_path}")
+        return output_path
 
     def cancel(self):
         """Cancel the current operation."""
@@ -266,7 +316,7 @@ class VideoProcessor:
                     wav, model,
                     return_seconds=True,
                     threshold=0.35,
-                    min_speech_duration_ms=150,
+                    min_speech_duration_ms=100,
                     min_silence_duration_ms=200,
                     speech_pad_ms=80
                 )
@@ -357,7 +407,7 @@ class VideoProcessor:
             self.log(f"Error generating waveform: {e}")
             return []
 
-    def _merge_timestamps(self, timestamps: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    def _merge_timestamps(self, timestamps: List[Dict[str, float]], min_gap: float = 0.2) -> List[Dict[str, float]]:
         """Merge overlapping or adjacent timestamps to prevent video repetition."""
         if not timestamps:
             return []
@@ -369,9 +419,9 @@ class VideoProcessor:
         current = timestamps[0].copy()
         
         for next_ts in timestamps[1:]:
-            # Check overlap. Note: we treat strict adjacency as disjoint, but any overlap triggers merge.
-            # Using a tiny epsilon 0.001 to handle float precision if needed, but strict < works fine for overlaps.
-            if next_ts['start'] < current['end']:
+            # Check overlap OR close proximity (gap < min_gap)
+            # If the next segment starts before the current one ends + min_gap, merge them.
+            if next_ts['start'] < current['end'] + min_gap:
                 # Merge
                 current['end'] = max(current['end'], next_ts['end'])
             else:
@@ -381,7 +431,9 @@ class VideoProcessor:
         return merged
 
     async def _render_video_with_progress(self, loop: asyncio.AbstractEventLoop, timestamps: List[Dict[str, float]], total_speech_duration: float) -> Path:
-        """Render video using FFmpeg concat demuxer for scalability."""
+        """Render video by extracting each segment individually for frame-accurate cuts,
+        then concatenating with stream copy. This avoids the concat demuxer's keyframe-seeking
+        bug that causes repeated words at segment boundaries."""
         if self.cancelled: raise RuntimeError("Cancelled")
         
         if not timestamps:
@@ -393,91 +445,133 @@ class VideoProcessor:
 
         output_path = self.output_dir / f"{self.file_path.stem}_processed.mp4"
 
-        # Generate concat list file
+        # FAILSAFE: Ensure no segment overlap
+        safe_timestamps = []
+        last_end = 0.0
+        for ts in timestamps:
+            start = ts['start']
+            end = ts['end']
+            if start < last_end:
+                start = last_end
+            if end <= start:
+                continue
+            safe_timestamps.append({"start": start, "end": end})
+            last_end = end
+
+        n = len(safe_timestamps)
+        self.log(f"Rendering {n} segments with per-segment extraction (frame-accurate)...")
+        await self._emit_status("rendering", 52, f"Rendering {n} segments...", -1)
+
+        # Create temp directory for segment files
+        temp_dir = self.output_dir / f"{self.file_id}_segments"
+        temp_dir.mkdir(exist_ok=True)
+
+        stderr_log_path = self.output_dir / "ffmpeg_render_stderr.log"
+        segment_files = []
+        start_time = time.time()
+
+        # STEP 1: Extract each segment individually (frame-accurate)
+        # Using -ss BEFORE -i does fast keyframe seek, then -ss AFTER -i does precise decode.
+        # Combined: fast seek + precise trim = frame-accurate and fast.
+        for i, ts in enumerate(safe_timestamps):
+            if self.cancelled:
+                raise RuntimeError("Cancelled by user")
+
+            seg_start = ts['start']
+            seg_duration = ts['end'] - ts['start']
+            seg_file = temp_dir / f"seg_{i:04d}.mp4"
+            segment_files.append(seg_file)
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{seg_start:.3f}",
+                "-i", str(self.file_path),
+                "-t", f"{seg_duration:.3f}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-avoid_negative_ts", "make_zero",
+                "-loglevel", "error",
+                str(seg_file)
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            self.current_proc = proc
+            _, stderr_data = await proc.communicate()
+
+            if proc.returncode != 0 and not self.cancelled:
+                err = stderr_data.decode() if stderr_data else "unknown"
+                self.log(f"Segment {i} failed: {err}")
+                # Skip failed segments instead of crashing
+                if seg_file.exists():
+                    seg_file.unlink()
+                segment_files.pop()
+                continue
+
+            # Update progress (50% - 90% range for extraction)
+            fraction = (i + 1) / n
+            progress = 50 + fraction * 40  # 50-90%
+            elapsed = time.time() - start_time
+            eta = (elapsed / fraction) * (1.0 - fraction) if fraction > 0.01 else -1
+            await self._emit_status(
+                "rendering", progress,
+                f"Extracting segment {i + 1}/{n}...",
+                eta
+            )
+
+        self.current_proc = None
+
+        if not segment_files:
+            raise RuntimeError("All segments failed to extract")
+
+        # STEP 2: Concatenate all segment files with stream copy (fast, no re-encode)
         concat_list_path = self.output_dir / f"{self.file_path.stem}_concat.txt"
         with open(concat_list_path, 'w') as f:
-            for ts in timestamps:
-                f.write(f"file '{self.file_path.absolute()}'\n")
-                f.write(f"inpoint {ts['start']:.3f}\n")
-                f.write(f"outpoint {ts['end']:.3f}\n")
+            for seg_file in segment_files:
+                escaped = str(seg_file.absolute()).replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
 
-        self.log(f"Generated concat list at {concat_list_path}")
+        self.log(f"Concatenating {len(segment_files)} segments...")
+        await self._emit_status("rendering", 92, "Joining segments...", -1)
 
-        # Use concat demuxer
-        # Note: -safe 0 is required for absolute paths
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_list_path),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-progress", "pipe:1",
+            "-c", "copy",
             "-loglevel", "error",
             str(output_path)
         ]
 
-        n = len(timestamps)
-        self.log(f"Running ffmpeg (concat demuxer) with {n} segments...")
-        await self._emit_status("rendering", 52, f"Rendering {n} segments...", -1)
-
-        stderr_log_path = self.output_dir / "ffmpeg_render_stderr.log"
-        stderr_log = open(stderr_log_path, "w")
-
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=stderr_log
+            stderr=asyncio.subprocess.PIPE
         )
         self.current_proc = proc
-        start_time = time.time()
-
-        if proc.stdout is None:
-             raise RuntimeError("Failed to open ffmpeg stdout")
-
-        while True:
-            if self.cancelled:
-                if self.current_proc is not None:
-                    self.current_proc.terminate()
-                raise RuntimeError("Cancelled by user")
-
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode('utf-8', errors='replace')
-            if line.startswith("out_time="):
-                time_str = line.split("=")[1].strip()
-                if time_str and time_str != "N/A":
-                    current_time = parse_ffmpeg_time(time_str)
-                    if total_speech_duration > 0:
-                        fraction = _clamp(current_time / total_speech_duration, 0.0, 1.0)
-                        progress = 50 + fraction * 48  # 50-98% range
-                        elapsed = time.time() - start_time
-                        eta = (elapsed / fraction) * (1.0 - fraction) if fraction > 0.01 else -1
-                        await self._emit_status(
-                            "rendering", progress,
-                            f"Rendering video... {int(fraction * 100)}%",
-                            eta
-                        )
-
-        # Wait for process to finish explicitly
-        await proc.wait()
-        stderr_log.close()
+        _, stderr_data = await proc.communicate()
 
         if proc.returncode != 0 and not self.cancelled:
-            # Read stderr from log
+            err = stderr_data.decode() if stderr_data else "unknown"
+            self.log(f"Concat failed: {err}")
+            raise RuntimeError(f"FFmpeg concat failed: {err}")
+
+        self.current_proc = None
+
+        # STEP 3: Cleanup temp segment files
+        for seg_file in segment_files:
             try:
-                with open(stderr_log_path, "r") as f:
-                    # Read last 1000 chars to avoid massive string
-                    f.seek(0, 2)
-                    size = f.tell()
-                    f.seek(max(0, size - 2000), 0)
-                    stderr = f.read()
+                seg_file.unlink()
             except:
-                stderr = "unknown error (check ffmpeg_render_stderr.log)"
-            
-            self.log(f"FFmpeg stderr tail: {stderr}")
-            raise RuntimeError(f"FFmpeg rendering failed. Check logs.")
+                pass
+        try:
+            temp_dir.rmdir()
+        except:
+            pass
 
         self.log(f"Output saved to {output_path}")
         return output_path

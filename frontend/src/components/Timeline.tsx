@@ -303,6 +303,27 @@ const Timeline: React.FC<TimelineProps> = ({
     const zoomIn = () => setZoom(z => Math.min(20, z + 1));
     const zoomOut = () => setZoom(z => Math.max(1, z - 1));
 
+    // Manual Time Input Handlers
+    const handleTimeChange = (type: 'start' | 'end', value: string) => {
+        if (!selection) return;
+        const val = parseFloat(value);
+        if (isNaN(val)) return;
+
+        // Validation
+        let newStart = selection.start;
+        let newEnd = selection.end;
+
+        if (type === 'start') {
+            newStart = Math.max(0, val);
+            if (newStart >= newEnd) newEnd = newStart + 0.1;
+        } else {
+            newEnd = Math.min(duration, val);
+            if (newEnd <= newStart) newStart = Math.max(0, newEnd - 0.1);
+        }
+
+        setSelection({ start: newStart, end: newEnd });
+    };
+
     return (
         <div className="w-full bg-[#0a0a0a] border border-gray-800 rounded-xl p-4 space-y-2">
             <div className="flex justify-between items-center text-xs text-gray-400">
@@ -333,7 +354,30 @@ const Timeline: React.FC<TimelineProps> = ({
                     {selection && (
                         <>
                             <div className="h-4 w-px bg-gray-700 mx-2"></div>
-                            <span className="text-blue-400">Sel: {(selection.end - selection.start).toFixed(1)}s</span>
+
+                            {/* Manual Time Inputs */}
+                            <div className="flex items-center gap-1 bg-gray-900 rounded px-2 py-0.5 border border-gray-700">
+                                <span className="text-gray-500">In:</span>
+                                <input
+                                    type="number"
+                                    step="0.1"
+                                    className="w-16 bg-transparent text-blue-400 focus:outline-none text-right"
+                                    value={selection.start.toFixed(2)}
+                                    onChange={(e) => handleTimeChange('start', e.target.value)}
+                                />
+                                <span className="text-gray-500 mx-1">Out:</span>
+                                <input
+                                    type="number"
+                                    step="0.1"
+                                    className="w-16 bg-transparent text-blue-400 focus:outline-none text-right"
+                                    value={selection.end.toFixed(2)}
+                                    onChange={(e) => handleTimeChange('end', e.target.value)}
+                                />
+                                <span className="text-gray-600 ml-1">s</span>
+                            </div>
+
+                            <div className="h-4 w-px bg-gray-700 mx-2"></div>
+
                             <button
                                 onClick={() => handleRangeAction('cut')}
                                 className="px-2 py-1 bg-red-900/50 text-red-200 rounded hover:bg-red-800 border border-red-800"

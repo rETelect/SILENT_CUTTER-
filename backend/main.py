@@ -43,6 +43,9 @@ local_file_paths: dict = {}
 # Track active processors for cancellation: file_id -> VideoProcessor
 active_processors: dict = {}
 
+# Track extra metadata (like source maps) for projects: file_id -> dict
+project_metadata: dict = {}
+
 # active websocket connections
 class ConnectionManager:
     def __init__(self):
@@ -67,21 +70,67 @@ def read_root():
 
 @app.post("/process_local")
 async def process_local(request: Request):
-    """Register a local file path for processing (Electron mode)."""
+    """Register local file path(s) for processing (Electron mode)."""
     body = await request.json()
+    # Support both single 'filePath' (legacy) and 'filePaths' (list)
     file_path_str = body.get("filePath")
+    file_paths_list = body.get("filePaths")
     
-    if not file_path_str:
+    input_paths = []
+    if file_paths_list and isinstance(file_paths_list, list):
+        input_paths = [Path(p) for p in file_paths_list]
+    elif file_path_str:
+        input_paths = [Path(file_path_str)]
+    
+    if not input_paths:
         return JSONResponse(status_code=400, content={"status": "error", "message": "No filePath provided"})
     
-    file_path = Path(file_path_str)
-    if not file_path.exists():
-        return JSONResponse(status_code=404, content={"status": "error", "message": "File not found on disk"})
-        
+    # Check existence
+    for p in input_paths:
+        if not p.exists():
+             return JSONResponse(status_code=404, content={"status": "error", "message": f"File not found: {p}"})
+
     file_id = str(uuid.uuid4())
-    local_file_paths[file_id] = file_path
     
-    return {"file_id": file_id, "filename": file_path.name, "status": "ready"}
+    if len(input_paths) == 1:
+        local_file_paths[file_id] = input_paths[0]
+        return {"file_id": file_id, "filename": input_paths[0].name, "status": "ready"}
+    else:
+        # Merge needed
+        output_filename = f"merged_{file_id}.mp4"
+        output_path = OUTPUT_DIR / output_filename
+        try:
+            print(f"Merging {len(input_paths)} files...")
+            
+            # 1. Calculate source map (names & durations) for frontend
+            import ffmpeg
+            current_time = 0.0
+            source_map = []
+            
+            for p in input_paths:
+                try:
+                    probe = ffmpeg.probe(str(p))
+                    dur = float(probe['format']['duration'])
+                    source_map.append({
+                        "filename": p.name,
+                        "start": current_time,
+                        "duration": dur,
+                        "end": current_time + dur
+                    })
+                    current_time += dur
+                except Exception as e:
+                    print(f"Error probing {p}: {e}")
+            
+            merged_path = await VideoProcessor.concat_videos(input_paths, output_path)
+            local_file_paths[file_id] = merged_path
+            
+            # Store metadata
+            project_metadata[file_id] = { "sources": source_map }
+
+            return {"file_id": file_id, "filename": output_filename, "status": "ready", "sources": source_map}
+        except Exception as e:
+            print(f"Merge error: {e}")
+            return JSONResponse(status_code=500, content={"status": "error", "message": f"Merge failed: {str(e)}"})
 
 @app.post("/cancel/{file_id}")
 async def cancel_processing(file_id: str):
@@ -219,7 +268,8 @@ async def get_project_status(file_id: str):
         "file_id": file_id,
         "status": "active", # Simplified
         "file_path": str(proc.file_path),
-        "segments": proc.segments
+        "segments": proc.segments,
+        "sources": proc.source_map
     }
 
 @app.get("/project/{file_id}/waveform")
@@ -267,18 +317,24 @@ async def websocket_endpoint(websocket: WebSocket, file_id: str):
         if file_id in active_processors:
             processor = active_processors[file_id]
         else:
-            # Fallback legacy logic for uploads
+            # Check local_file_paths (from /process_local)
             file_path = None
-            for f in UPLOAD_DIR.iterdir():
-                if f.name.startswith(file_id):
-                    file_path = f
-                    break
+            if file_id in local_file_paths:
+                file_path = local_file_paths[file_id]
+            else:
+                # Fallback legacy logic for uploads
+                for f in UPLOAD_DIR.iterdir():
+                    if f.name.startswith(file_id):
+                        file_path = f
+                        break
             
             if not file_path:
                 await websocket.send_json({"status": "error", "message": "File not found"})
                 return
 
             processor = VideoProcessor(file_path, output_dir=OUTPUT_DIR, file_id=file_id)
+            if file_id in project_metadata:
+                 processor.source_map = project_metadata[file_id].get("sources", [])
             active_processors[file_id] = processor
         
         async def status_callback(status):

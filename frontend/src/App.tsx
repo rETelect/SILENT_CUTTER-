@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react';
 import Scanner from './components/Scanner';
 import UploadZone from './components/UploadZone';
-import Timeline, { type Segment } from './components/Timeline';
+import { type Segment } from './components/Timeline';
+import ManualEditor from './components/ManualEditor';
 import './App.css';
 
 // Add global type for Electron API
@@ -27,6 +28,9 @@ function App() {
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [errorMessage, setErrorMessage] = useState<string>('');
+  const [isManualMode, setIsManualMode] = useState(false);
 
   const formatFileSize = (bytes: number): string => {
     if (bytes < 1024) return `${bytes} B`;
@@ -35,32 +39,44 @@ function App() {
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   };
 
+  const handleFileSelect = (files: File[]) => {
+    setSelectedFiles(prev => [...prev, ...files]);
+    setErrorMessage('');
+  };
 
+  const removeFile = (index: number) => {
+    setSelectedFiles(prev => prev.filter((_, i) => i !== index));
+  };
 
-  const handleUpload = async (file: File) => {
+  const startProcessing = async () => {
+    if (selectedFiles.length === 0) return;
+
     setIsUploading(true);
     setStatus('UPLOADING');
     setUploadProgress(0);
     setUploadEta('calculating...');
+    setErrorMessage('');
 
     try {
       // ELECTRON DESKTOP APP FLOW:
-      // If running in Electron, get the real file path and process locally (Zero Copy / Zero Upload)
       if (window.electron) {
-        setUploadEta('Getting file path...');
-        // In Electron, File object path property is stripped in renderer, but we exposed a helper
-        const filePath = await window.electron.getFilePath(file);
-        console.log("Processing local file:", filePath);
+        setUploadEta('Getting file paths...');
+        const filePaths = [];
+        for (const file of selectedFiles) {
+          const path = await window.electron.getFilePath(file);
+          filePaths.push(path);
+        }
+        console.log("Processing local files:", filePaths);
 
         setUploadProgress(100);
         setStatus('PROCESSING');
         setUploadEta('Starting local processing...');
 
-        // Call backend to start processing local file directly
-        const res = await fetch('http://localhost:8000/analyze', {
+        // Call backend to start processing local files directly
+        const res = await fetch('http://localhost:8000/process_local', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ file_path: filePath }),
+          body: JSON.stringify({ filePaths: filePaths }),
         });
 
         const data = await res.json();
@@ -74,17 +90,23 @@ function App() {
         setIsUploading(false);
         setUploadProgress(100);
         setUploadEta('');
-        connectWebSocket(data.file_id);
         return;
       }
 
-      // 2. Fallback: Chunked Upload (Browser Mode)
-      // chunk size 1MB (conservative)
+      // Browser Fallback (Single file only for now)
+      if (selectedFiles.length > 1) {
+        alert("Multi-file merge is currently optimized for Desktop App (Electron). In browser, please upload a single pre-merged file or use the Desktop App.");
+        setIsUploading(false);
+        setStatus('IDLE');
+        return;
+      }
+
+      const file = selectedFiles[0];
       const CHUNK_SIZE = 1024 * 1024;
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const startTime = Date.now();
 
-      // Step 1: Initialize the chunked upload
+      // Step 1: Initialize
       const initRes = await fetch('http://localhost:8000/upload/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -93,10 +115,9 @@ function App() {
       const initData = await initRes.json();
       const fileId = initData.file_id;
 
-      // Helper to allow UI/GC to breathe
       const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-      // Step 2: Send chunks one by one
+      // Step 2: Send chunks
       const sendChunk = (chunkIndex: number): Promise<void> => {
         return new Promise((resolve, reject) => {
           const start = chunkIndex * CHUNK_SIZE;
@@ -107,7 +128,6 @@ function App() {
           xhr.open('POST', `http://localhost:8000/upload/chunk/${fileId}`, true);
           xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
-          // Track individual chunk progress for smoother updates
           xhr.upload.onprogress = (e) => {
             if (e.lengthComputable) {
               const chunkBytesSent = start + e.loaded;
@@ -137,7 +157,6 @@ function App() {
 
       for (let i = 0; i < totalChunks; i++) {
         await sendChunk(i);
-        // Yield to main thread for GC and UI updates
         await sleep(50);
       }
 
@@ -153,9 +172,10 @@ function App() {
       setUploadEta('');
       connectWebSocket(fileId);
 
-    } catch (err) {
-      console.error("Upload failed", err);
+    } catch (err: any) {
+      console.error("Upload/Process failed", err);
       setStatus('ERROR');
+      setErrorMessage(err.message || "An unexpected error occurred");
       setIsUploading(false);
     }
   };
@@ -171,8 +191,6 @@ function App() {
     const rm = m % 60;
     return `${h}h ${rm}m left`;
   };
-
-
 
   const getStepLabel = (step: string): string => {
     const labels: Record<string, string> = {
@@ -193,8 +211,6 @@ function App() {
       await fetch(`http://localhost:8000/cancel/${fileId}`, {
         method: 'POST',
       });
-      // UI update will happen via WebSocket status 'cancelled', 
-      // but we can also force it here just in case WS is dead
       setStatus('IDLE');
       setStepLabel('');
       setProgress(0);
@@ -210,6 +226,8 @@ function App() {
     setProcessingEta('');
     setStepLabel('');
     setUploadEta('');
+    setSelectedFiles([]);
+    setErrorMessage('');
   };
 
   const connectWebSocket = (fid: string) => {
@@ -217,6 +235,14 @@ function App() {
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
+
+      // Handle error status from WS
+      if (data.status === 'error' || data.step === 'error') {
+        setStatus('ERROR');
+        setErrorMessage(data.message || data.details || "Processing error");
+        return;
+      }
+
       if (data.progress !== undefined) setProgress(data.progress);
       if (data.step) {
         setStatus(data.step);
@@ -241,7 +267,8 @@ function App() {
 
     ws.onerror = (e) => {
       console.error("WebSocket error", e);
-      setStatus('CONNECTION_ERROR');
+      setStatus('ERROR');
+      setErrorMessage("Connection lost to server");
     }
   };
 
@@ -250,7 +277,6 @@ function App() {
       const res = await fetch(`http://localhost:8000/project/${fid}`);
       const data = await res.json();
       if (data.segments) setSegments(data.segments);
-      // We can get duration from video metadata when it loads
     } catch (e) {
       console.error("Failed to fetch segments", e);
     }
@@ -258,7 +284,7 @@ function App() {
 
   const handleExport = async () => {
     if (!fileId) return;
-    setStatus('RENDERING'); // Custom local status
+    setStatus('RENDERING');
     try {
       await fetch('http://localhost:8000/render', {
         method: 'POST',
@@ -268,9 +294,10 @@ function App() {
           segments: segments.filter((s: Segment) => s.type === 'keep' || !s.type)
         }),
       });
-    } catch (e) {
+    } catch (e: any) {
       console.error("Export failed", e);
       setStatus('ERROR');
+      setErrorMessage(e.message || "Export failed");
     }
   };
 
@@ -282,9 +309,27 @@ function App() {
     if (videoRef.current) setDuration(videoRef.current.duration);
   };
 
+
   return (
     <div className="min-h-screen w-full bg-[#050505] text-white flex flex-col items-center justify-center p-8">
-      <div className="w-full max-w-4xl space-y-8">
+      {isManualMode && fileId && (
+        <div className="fixed inset-0 z-50 bg-black">
+          <ManualEditor
+            fileId={fileId}
+            duration={duration}
+            segments={segments}
+            onSegmentsChange={setSegments}
+            currentTime={currentTime}
+            onSeek={(t) => {
+              setCurrentTime(t);
+              if (videoRef.current) videoRef.current.currentTime = t;
+            }}
+            onExit={() => setIsManualMode(false)}
+          />
+        </div>
+      )}
+
+      <div className={`w-full max-w-4xl space-y-8 ${isManualMode ? 'hidden' : ''}`}>
         <header className="text-center space-y-2">
           <h1 className="text-4xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-green-400">
             JUMP-CUTTER AI
@@ -294,18 +339,56 @@ function App() {
 
         <main className="w-full space-y-6">
           {status === 'IDLE' || status === 'UPLOADING' ? (
-            <UploadZone
-              onFileSelect={handleUpload}
-              isUploading={isUploading}
-              uploadProgress={uploadProgress}
-              uploadEta={uploadEta}
-            />
+            <div className="space-y-4">
+              <UploadZone
+                onFileSelect={handleFileSelect}
+                isUploading={isUploading}
+                uploadProgress={uploadProgress}
+                uploadEta={uploadEta}
+              />
+
+              {selectedFiles.length > 0 && !isUploading && (
+                <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-4 animate-fade-in">
+                  <div className="flex justify-between items-center">
+                    <h3 className="text-lg font-bold text-gray-300">Selected Files ({selectedFiles.length})</h3>
+                    <button
+                      onClick={() => setSelectedFiles([])}
+                      className="text-xs text-gray-500 hover:text-red-400"
+                    >
+                      Clear All
+                    </button>
+                  </div>
+
+                  <ul className="space-y-2 max-h-40 overflow-y-auto custom-scrollbar">
+                    {selectedFiles.map((file, i) => (
+                      <li key={i} className="flex justify-between items-center bg-gray-800/50 p-2 rounded">
+                        <span className="text-sm truncate max-w-[80%]">{file.name}</span>
+                        <button
+                          onClick={() => removeFile(i)}
+                          className="text-gray-500 hover:text-red-400 px-2"
+                        >
+                          ✕
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+
+                  <button
+                    onClick={startProcessing}
+                    className="w-full py-3 bg-gradient-to-r from-blue-600 to-green-600 hover:from-blue-500 hover:to-green-500 rounded-lg font-bold text-lg shadow-lg transition-all transform hover:scale-[1.02]"
+                  >
+                    START PROCESSING
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             <Scanner
               progress={progress}
               status={status}
               stepLabel={stepLabel}
               eta={processingEta}
+              errorMessage={errorMessage}
               onCancel={handleCancel}
               onReset={handleReset}
             />
@@ -314,14 +397,9 @@ function App() {
           {status === 'TIMELINE' && fileId && (
             <div className="space-y-4">
               <div className="relative aspect-video bg-black rounded-lg overflow-hidden border border-gray-800">
-                {/* Video Player for Preview */}
                 <video
                   ref={videoRef}
-                  src={`http://localhost:8000/stream/${fileId}`} // Need stream endpoint or file path?
-                  // Actually exposing local file is tricky in browser.
-                  // But in Electron we can just use file:// IF allowed?
-                  // Or serve via backend static?
-                  // Let's assume we can serve source via /project/{id}/video
+                  src={`http://localhost:8000/stream/${fileId}`}
                   className="w-full h-full"
                   controls
                   onTimeUpdate={onTimeUpdate}
@@ -329,18 +407,16 @@ function App() {
                 />
               </div>
 
-              <Timeline
-                fileId={fileId}
-                duration={duration}
-                segments={segments}
-                onSegmentsChange={setSegments}
-                currentTime={currentTime}
-                onSeek={(t) => {
-                  if (videoRef.current) videoRef.current.currentTime = t;
-                }}
-              />
+              {/* Legacy Timeline Removed as per user request */}
 
               <div className="flex justify-end gap-4">
+                <button
+                  onClick={() => setIsManualMode(true)}
+                  className="px-6 py-2 bg-purple-600 hover:bg-purple-500 rounded-full font-bold shadow-lg transition"
+                >
+                  Open Manual Editor
+                </button>
+
                 <button
                   onClick={handleReset}
                   className="px-6 py-2 rounded-full border border-gray-600 hover:bg-gray-800 transition flex items-center gap-2"

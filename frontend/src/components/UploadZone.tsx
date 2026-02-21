@@ -1,7 +1,7 @@
 import React, { useCallback } from 'react';
 
 interface UploadZoneProps {
-    onFileSelect: (file: File) => void;
+    onFileSelect: (files: File[]) => void;
     isUploading: boolean;
     uploadProgress?: number;
     uploadEta?: string;
@@ -11,13 +11,16 @@ const UploadZone: React.FC<UploadZoneProps> = ({ onFileSelect, isUploading, uplo
     const handleDrop = useCallback((e: React.DragEvent) => {
         e.preventDefault();
         if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-            onFileSelect(e.dataTransfer.files[0]);
+            // Convert FileList to Array
+            const files = Array.from(e.dataTransfer.files);
+            onFileSelect(files);
         }
     }, [onFileSelect]);
 
     const handleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files.length > 0) {
-            onFileSelect(e.target.files[0]);
+            const files = Array.from(e.target.files);
+            onFileSelect(files);
         }
     }, [onFileSelect]);
 
@@ -39,6 +42,7 @@ const UploadZone: React.FC<UploadZoneProps> = ({ onFileSelect, isUploading, uplo
                 className="hidden"
                 id="file-upload"
                 accept="video/*"
+                multiple
                 onChange={handleChange}
                 disabled={isUploading}
             />
